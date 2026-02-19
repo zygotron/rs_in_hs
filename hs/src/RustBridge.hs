@@ -43,7 +43,8 @@ import Control.Monad.Reader (MonadReader, ReaderT (..), ask, asks)
 import Data.ByteString (ByteString, useAsCStringLen)
 import Data.ByteString.Char8 qualified as BS8
 import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
-import Data.Store (Store, decode, encode)
+import Codec.Serialise (Serialise, deserialiseOrFail, serialise)
+import qualified Data.ByteString.Lazy as LBS
 import System.Timeout (timeout)
 import FFI (callResponseFunPtr, h2rCall, h2rCast, h2rDeinit, h2rInit, h2rSubscribe, h2rNextEvent)
 import Foreign.C.Types (CInt)
@@ -80,7 +81,7 @@ type Rust = RustT IO
 -- @
 withRust :: Config -> RustT IO a -> IO a
 withRust config (RustT action) = do
-  let configBs = encode config
+  let configBs = LBS.toStrict (serialise config)
   useAsCStringLen configBs $ \(ptr, len) ->
     h2rInit callResponseFunPtr (castPtr ptr) (fromIntegral len)
   threadsRef <- newIORef []
@@ -101,18 +102,18 @@ withRust config (RustT action) = do
 --
 -- Creates an 'MVar', passes its 'StablePtr' to Rust alongside the serialized
 -- request. Rust's dispatch thread will call @callResponse@ to fill the 'MVar'.
-callRust :: (Store req, Store resp, MonadIO m) => req -> RustT m resp
+callRust :: (Serialise req, Serialise resp, MonadIO m) => req -> RustT m resp
 callRust req = do
   maxLen <- asks envMaxMsgLen
   liftIO $ do
     mvar <- newEmptyMVar :: IO (MVar ByteString)
     sptr <- newStablePtr mvar
-    let bs = encode req
+    let bs = LBS.toStrict (serialise req)
     useAsCStringLen bs $ \(ptr, len) -> do
       checkMsgLen "callRust" maxLen len
       h2rCall sptr (castPtr ptr) (fromIntegral len)
     respBs <- takeMVar mvar
-    case decode respBs of
+    case deserialiseOrFail (LBS.fromStrict respBs) of
       Right v  -> pure v
       Left err -> throwIO err
 
@@ -120,30 +121,30 @@ callRust req = do
 -- Returns 'Nothing' if the timeout fires before Rust responds.
 -- Uses 'decode' (non-partial) so decode failures throw a structured
 -- 'PeekException' rather than an opaque error.
-callRustTimeout :: (Store req, Store resp, MonadIO m)
+callRustTimeout :: (Serialise req, Serialise resp, MonadIO m)
                 => Int -> req -> RustT m (Maybe resp)
 callRustTimeout usec req = do
   maxLen <- asks envMaxMsgLen
   liftIO $ do
     mvar <- newEmptyMVar :: IO (MVar ByteString)
     sptr <- newStablePtr mvar
-    let bs = encode req
+    let bs = LBS.toStrict (serialise req)
     useAsCStringLen bs $ \(ptr, len) -> do
       checkMsgLen "callRustTimeout" maxLen len
       h2rCall sptr (castPtr ptr) (fromIntegral len)
     result <- timeout usec (takeMVar mvar)
     case result of
       Nothing -> pure Nothing
-      Just respBs -> case decode respBs of
+      Just respBs -> case deserialiseOrFail (LBS.fromStrict respBs) of
         Right v  -> pure (Just v)
         Left err -> throwIO err
 
 -- | Send a cast (fire-and-forget) to Rust. Returns immediately.
-castRust :: (Store req, MonadIO m) => req -> RustT m ()
+castRust :: (Serialise req, MonadIO m) => req -> RustT m ()
 castRust req = do
   maxLen <- asks envMaxMsgLen
   liftIO $ do
-    let bs = encode req
+    let bs = LBS.toStrict (serialise req)
     useAsCStringLen bs $ \(ptr, len) -> do
       checkMsgLen "castRust" maxLen len
       h2rCast (castPtr ptr) (fromIntegral len)
@@ -153,7 +154,7 @@ castRust req = do
 -- Calls @h2r_subscribe@ with the topic string, then spawns a reader thread
 -- that loops @h2r_next_event@, decodes each event, and writes it to the queue.
 -- The reader thread is automatically cancelled when 'withRust' exits.
-subscribe :: (Store event, MonadIO m) => String -> RustT m (TQueue event)
+subscribe :: (Serialise event, MonadIO m) => String -> RustT m (TQueue event)
 subscribe topic = do
   threadsRef <- asks envSubThreads
   liftIO $ do
@@ -167,7 +168,7 @@ subscribe topic = do
 
 -- | Internal event reader loop. Blocks on @h2r_next_event@ and writes
 -- decoded events to the queue. Exits when the channel disconnects (status 1).
-eventLoop :: Store event => CInt -> TQueue event -> IO ()
+eventLoop :: Serialise event => CInt -> TQueue event -> IO ()
 eventLoop subId queue = do
   mvar <- newEmptyMVar :: IO (MVar ByteString)
   sptr <- newStablePtr mvar
@@ -175,7 +176,7 @@ eventLoop subId queue = do
   case status of
     0 -> do
       bs <- takeMVar mvar
-      case decode bs of
+      case deserialiseOrFail (LBS.fromStrict bs) of
         Right event -> atomically $ writeTQueue queue event
         Left err    -> throwIO err
       eventLoop subId queue

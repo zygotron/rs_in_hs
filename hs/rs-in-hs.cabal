@@ -53,9 +53,10 @@ library
     async,
     base ^>=4.18.3.0,
     bytestring,
+    cborg,
     mtl,
+    serialise,
     stm,
-    store >=0.7.20,
 
   hs-source-dirs: src
   default-language: GHC2021
@@ -67,7 +68,10 @@ library
 
 executable rs-in-hs
   import: warnings
-  ghc-options: -threaded -rtsopts
+  ghc-options:
+    -threaded
+    -rtsopts
+
   -- .hs or .lhs file containing the Main module.
   main-is: Main.hs
   -- Modules included in this executable, other than Main.

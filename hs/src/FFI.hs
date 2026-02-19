@@ -66,7 +66,7 @@ foreign import ccall "&callResponse"
 
 -- | Initialize the Rust side. Called once at startup.
 --
--- Passes the @callResponse@ function pointer and a serialized 'Config'.
+-- Passes the @callResponse@ function pointer and a CBOR-serialized 'Config'.
 -- Context is stored in Rust-side module-level statics — no pointer returned.
 --
 -- Declared @safe@ because Rust spawns threads that call back into Haskell.

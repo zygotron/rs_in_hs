@@ -11,44 +11,55 @@ use std::sync::{LazyLock, Mutex, RwLock};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::dispatch;
 use crate::worker;
 
 // ---------------------------------------------------------------------------
-// Message types (shared with Haskell via store/serde_store serialization)
+// Message types (shared with Haskell via CBOR/ciborium serialization)
 // ---------------------------------------------------------------------------
 
 /// Configuration passed from Haskell at init time.
-/// Field order must match Haskell's `newtype Config` exactly (serde_store layout).
+/// Serialized as a single CBOR unsigned integer (the max_msg_len value),
+/// matching the Haskell `instance Serialise Config`.
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(transparent)]
 pub struct Config {
     pub max_msg_len: u32,
 }
 
 /// Variant order must match the Haskell `data MessageBody = Ping | Pong` exactly.
-#[derive(Serialize, Deserialize, Debug)]
+/// Serialized as a single CBOR unsigned integer (variant index).
+#[derive(Serialize_repr, Deserialize_repr, Debug)]
+#[repr(u8)]
 pub enum MessageBody {
-    Ping,
-    Pong,
+    Ping = 0,
+    Pong = 1,
 }
 
 impl MessageBody {
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_store::to_bytes(self).expect("serialize MessageBody")
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("CBOR serialization failed");
+        buf
     }
 }
 
 /// Variant order must match the Haskell `data EventBody = CastReceived | Heartbeat` exactly.
-#[derive(Serialize, Deserialize, Debug)]
+/// Serialized as a single CBOR unsigned integer (variant index).
+#[derive(Serialize_repr, Deserialize_repr, Debug)]
+#[repr(u8)]
 pub enum EventBody {
-    CastReceived,
-    Heartbeat,
+    CastReceived = 0,
+    Heartbeat = 1,
 }
 
 impl EventBody {
     pub fn to_bytes(&self) -> Vec<u8> {
-        serde_store::to_bytes(self).expect("serialize EventBody")
+        let mut buf = Vec::new();
+        ciborium::into_writer(self, &mut buf).expect("CBOR serialization failed");
+        buf
     }
 }
 
@@ -201,7 +212,7 @@ pub unsafe extern "C" fn h2r_init(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let config_bytes = unsafe { std::slice::from_raw_parts(config_data, config_len) };
         let config: Config =
-            serde_store::from_bytes(config_bytes).expect("h2r_init: deserialize Config");
+            ciborium::from_reader(config_bytes).expect("h2r_init: deserialize Config");
 
         /// Channel capacity for control messages. Sized for bursts without
         /// unbounded growth. send() blocks when full — natural backpressure.
@@ -300,7 +311,7 @@ pub unsafe extern "C" fn h2r_call(stable_ptr: *mut c_void, data: *const u8, len:
             senders.config.max_msg_len,
         );
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        let body: MessageBody = serde_store::from_bytes(bytes).expect("h2r_call: deserialize");
+        let body: MessageBody = ciborium::from_reader(bytes as &[u8]).expect("h2r_call: deserialize");
         let msg = CallMessage {
             token: CallToken::new(stable_ptr),
             body,
@@ -329,7 +340,7 @@ pub unsafe extern "C" fn h2r_cast(data: *const u8, len: usize) {
             senders.config.max_msg_len,
         );
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        let body: MessageBody = serde_store::from_bytes(bytes).expect("h2r_cast: deserialize");
+        let body: MessageBody = ciborium::from_reader(bytes as &[u8]).expect("h2r_cast: deserialize");
         let msg = CastMessage { body };
         senders.cast_tx.send(msg).expect("h2r_cast: send");
     }));
