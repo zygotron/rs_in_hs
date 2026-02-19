@@ -1,2 +1,3 @@
 rs/target
 hs/dist-newstyle
+hs/cabal.project.local

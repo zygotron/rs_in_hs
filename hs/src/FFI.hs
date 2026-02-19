@@ -20,13 +20,15 @@ module FFI
     h2rDeinit,
     h2rCall,
     h2rCast,
+    h2rSubscribe,
+    h2rNextEvent,
   )
 where
 
 import Control.Concurrent.MVar (MVar, tryPutMVar)
 import Control.Monad (void)
 import Data.ByteString (ByteString, packCStringLen)
-import Foreign.C.Types (CSize (..))
+import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Ptr (FunPtr, Ptr, castPtr)
 import Foreign.StablePtr (StablePtr, deRefStablePtr, freeStablePtr)
 
@@ -88,3 +90,20 @@ foreign import ccall safe "h2r_call"
 -- Declared @safe@ as a conservative default.
 foreign import ccall safe "h2r_cast"
   h2rCast :: Ptr () -> CSize -> IO ()
+
+-- | Subscribe to an event topic. Returns a subscription ID (>= 0).
+--
+-- Takes a topic string as pointer + length.
+-- Declared @safe@ — may allocate channels internally.
+foreign import ccall safe "h2r_subscribe"
+  h2rSubscribe :: Ptr () -> CSize -> IO CInt
+
+-- | Block until the next event on the given subscription.
+--
+-- Takes a subscription ID and a StablePtr to an @MVar ByteString@.
+-- On event: calls @callResponse@ to fill the MVar, returns 0.
+-- On shutdown (channel disconnected): returns 1.
+--
+-- Declared @safe@ because it blocks.
+foreign import ccall safe "h2r_next_event"
+  h2rNextEvent :: CInt -> StablePtr (MVar ByteString) -> IO CInt

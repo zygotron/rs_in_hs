@@ -1,13 +1,14 @@
 //! Worker thread — selects on call and cast channels, processes messages.
 
-use flume::{Receiver, Sender};
+use flume::{Receiver, Sender, TrySendError};
 
-use crate::ffi::{CallMessage, CastMessage, MessageBody, ResponseMessage};
+use crate::ffi::{CallMessage, CastMessage, EventBody, EventMessage, MessageBody, ResponseMessage};
 
 pub fn run(
     call_rx: Receiver<CallMessage>,
     cast_rx: Receiver<CastMessage>,
     response_tx: Sender<ResponseMessage>,
+    event_tx: Sender<EventMessage>,
 ) {
     let mut call_alive = true;
     let mut cast_alive = true;
@@ -30,7 +31,12 @@ pub fn run(
 
         if cast_alive {
             sel = sel.recv(&cast_rx, |result| match result {
-                Ok(CastMessage { .. }) => {}
+                Ok(CastMessage { .. }) => {
+                    let event = EventMessage { body: EventBody::CastReceived };
+                    if let Err(TrySendError::Full(_)) = event_tx.try_send(event) {
+                        eprintln!("warning: event channel full, dropping CastReceived event");
+                    }
+                }
                 Err(_) => cast_alive = false,
             });
         }

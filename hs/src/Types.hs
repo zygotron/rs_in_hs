@@ -2,6 +2,7 @@
 
 module Types
   ( MessageBody (..),
+    EventBody (..),
     Config (..),
   )
 where
@@ -21,6 +22,13 @@ instance Store MessageBody
 -- Field order must match Rust's @struct Config@ exactly (serde_store layout).
 newtype Config = Config
   { maxMsgLen :: Word32
-  } deriving (Generic, Show)
+  }
+  deriving (Generic, Show)
 
 instance Store Config
+
+-- | Variant order must match Rust's @enum EventBody { CastReceived, Heartbeat }@ exactly.
+data EventBody = CastReceived | Heartbeat
+  deriving (Generic, Show)
+
+instance Store EventBody

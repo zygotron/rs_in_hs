@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 //! FFI boundary between Rust and Haskell.
 //!
-//! Exports `h2r_init`, `h2r_call`, `h2r_cast`, and `h2r_deinit` as C symbols.
+//! Exports `h2r_init`, `h2r_call`, `h2r_cast`, `h2r_subscribe`,
+//! `h2r_next_event`, and `h2r_deinit` as C symbols.
 //! Haskell callbacks are passed as function pointers at init time —
 //! Rust never links against Haskell symbols by name.
 
@@ -38,8 +39,21 @@ impl MessageBody {
     }
 }
 
+/// Variant order must match the Haskell `data EventBody = CastReceived | Heartbeat` exactly.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum EventBody {
+    CastReceived,
+    Heartbeat,
+}
+
+impl EventBody {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serde_store::to_bytes(self).expect("serialize EventBody")
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Call/cast message wrappers (Rust-side only)
+// Call/cast/event message wrappers (Rust-side only)
 // ---------------------------------------------------------------------------
 
 pub struct CallMessage {
@@ -54,6 +68,10 @@ pub struct CastMessage {
 pub struct ResponseMessage {
     pub token: CallToken,
     pub body: MessageBody,
+}
+
+pub struct EventMessage {
+    pub body: EventBody,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +153,7 @@ impl CallResponseCallback {
 struct Senders {
     call_tx: flume::Sender<CallMessage>,
     cast_tx: flume::Sender<CastMessage>,
+    event_tx: flume::Sender<EventMessage>,
     config: Config,
 }
 
@@ -151,6 +170,15 @@ struct ShutdownState {
 // Write lock only taken at deinit.
 static SENDERS: LazyLock<RwLock<Option<Senders>>> = LazyLock::new(|| RwLock::new(None));
 static SHUTDOWN: LazyLock<Mutex<Option<ShutdownState>>> = LazyLock::new(|| Mutex::new(None));
+
+// Stored globally at init so h2r_next_event can call back into Haskell.
+static CALL_RESPONSE_FN: LazyLock<Mutex<Option<CallResponseFn>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+// Subscription receivers, indexed by subscription ID.
+// Each entry is a Receiver<EventMessage> from a bounded channel.
+static SUBSCRIPTIONS: LazyLock<Mutex<Vec<Option<flume::Receiver<EventMessage>>>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 // ---------------------------------------------------------------------------
 // Exported C functions
@@ -170,32 +198,48 @@ pub unsafe extern "C" fn h2r_init(
 ) {
     // catch_unwind: panicking across extern "C" is UB. We abort on panic
     // so AssertUnwindSafe is justified — no recovery, no inconsistent state.
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let config_bytes = unsafe { std::slice::from_raw_parts(config_data, config_len) };
-            let config: Config =
-                serde_store::from_bytes(config_bytes).expect("h2r_init: deserialize Config");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let config_bytes = unsafe { std::slice::from_raw_parts(config_data, config_len) };
+        let config: Config =
+            serde_store::from_bytes(config_bytes).expect("h2r_init: deserialize Config");
 
-            /// Channel capacity for control messages. Sized for bursts without
-            /// unbounded growth. send() blocks when full — natural backpressure.
-            const CHANNEL_CAPACITY: usize = 256;
+        /// Channel capacity for control messages. Sized for bursts without
+        /// unbounded growth. send() blocks when full — natural backpressure.
+        const CHANNEL_CAPACITY: usize = 256;
 
-            let (call_tx, call_rx) = flume::bounded::<CallMessage>(CHANNEL_CAPACITY);
-            let (cast_tx, cast_rx) = flume::bounded::<CastMessage>(CHANNEL_CAPACITY);
-            let (response_tx, response_rx) =
-                flume::bounded::<ResponseMessage>(CHANNEL_CAPACITY);
+        let (call_tx, call_rx) = flume::bounded::<CallMessage>(CHANNEL_CAPACITY);
+        let (cast_tx, cast_rx) = flume::bounded::<CastMessage>(CHANNEL_CAPACITY);
+        let (response_tx, response_rx) = flume::bounded::<ResponseMessage>(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = flume::bounded::<EventMessage>(CHANNEL_CAPACITY);
 
-            let worker_handle =
-                thread::spawn(move || worker::run(call_rx, cast_rx, response_tx));
+        let worker_event_tx = event_tx.clone();
+        let worker_handle =
+            thread::spawn(move || worker::run(call_rx, cast_rx, response_tx, worker_event_tx));
 
-            let cb = CallResponseCallback::new(call_response_fn);
-            let dispatch_handle = thread::spawn(move || dispatch::run(response_rx, cb));
+        let cb = CallResponseCallback::new(call_response_fn);
+        let dispatch_handle = thread::spawn(move || dispatch::run(response_rx, cb));
 
-            *SENDERS.write().expect("SENDERS lock poisoned") =
-                Some(Senders { call_tx, cast_tx, config });
-            *SHUTDOWN.lock().expect("SHUTDOWN lock poisoned") =
-                Some(ShutdownState { worker_handle, dispatch_handle });
-        }));
+        // Store callback globally for h2r_next_event.
+        *CALL_RESPONSE_FN
+            .lock()
+            .expect("CALL_RESPONSE_FN lock poisoned") = Some(call_response_fn);
+
+        // Pre-create subscription 0 with the event receiver.
+        // h2r_subscribe will return this for now; later the dispatcher
+        // will create per-topic channels.
+        *SUBSCRIPTIONS.lock().expect("SUBSCRIPTIONS lock poisoned") = vec![Some(event_rx)];
+
+        *SENDERS.write().expect("SENDERS lock poisoned") = Some(Senders {
+            call_tx,
+            cast_tx,
+            event_tx,
+            config,
+        });
+        *SHUTDOWN.lock().expect("SHUTDOWN lock poisoned") = Some(ShutdownState {
+            worker_handle,
+            dispatch_handle,
+        });
+    }));
     if let Err(e) = result {
         eprintln!("h2r_init panicked: {:?}", e);
         std::process::abort();
@@ -208,16 +252,27 @@ pub unsafe extern "C" fn h2r_init(
 /// Then locks SHUTDOWN, takes thread handles, and joins them.
 #[unsafe(no_mangle)]
 pub extern "C" fn h2r_deinit() {
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Drop senders to disconnect channels, signalling threads to exit.
-            *SENDERS.write().expect("SENDERS lock poisoned") = None;
-            // Take thread handles and join.
-            if let Some(state) = SHUTDOWN.lock().expect("SHUTDOWN lock poisoned").take() {
-                state.worker_handle.join().expect("worker thread panicked");
-                state.dispatch_handle.join().expect("dispatch thread panicked");
-            }
-        }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Drop senders to disconnect channels, signalling threads to exit.
+        *SENDERS.write().expect("SENDERS lock poisoned") = None;
+        // Clear subscriptions (drops receivers).
+        SUBSCRIPTIONS
+            .lock()
+            .expect("SUBSCRIPTIONS lock poisoned")
+            .clear();
+        // Clear stored callback.
+        *CALL_RESPONSE_FN
+            .lock()
+            .expect("CALL_RESPONSE_FN lock poisoned") = None;
+        // Take thread handles and join.
+        if let Some(state) = SHUTDOWN.lock().expect("SHUTDOWN lock poisoned").take() {
+            state.worker_handle.join().expect("worker thread panicked");
+            state
+                .dispatch_handle
+                .join()
+                .expect("dispatch thread panicked");
+        }
+    }));
     if let Err(e) = result {
         eprintln!("h2r_deinit panicked: {:?}", e);
         std::process::abort();
@@ -234,30 +289,24 @@ pub extern "C" fn h2r_deinit() {
 /// - `data` must point to `len` valid bytes (serialized request).
 /// - `stable_ptr` must be a valid Haskell StablePtr (MVar ByteString).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn h2r_call(
-    stable_ptr: *mut c_void,
-    data: *const u8,
-    len: usize,
-) {
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let guard = SENDERS.read().expect("SENDERS lock poisoned");
-            let senders = guard.as_ref().expect("h2r_call: not initialized");
-            // Defense-in-depth: Haskell validates before calling, but assert here too.
-            assert!(
-                len <= senders.config.max_msg_len as usize,
-                "h2r_call: len ({len}) exceeds max_msg_len ({})",
-                senders.config.max_msg_len,
-            );
-            let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-            let body: MessageBody =
-                serde_store::from_bytes(bytes).expect("h2r_call: deserialize");
-            let msg = CallMessage {
-                token: CallToken::new(stable_ptr),
-                body,
-            };
-            senders.call_tx.send(msg).expect("h2r_call: send");
-        }));
+pub unsafe extern "C" fn h2r_call(stable_ptr: *mut c_void, data: *const u8, len: usize) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let guard = SENDERS.read().expect("SENDERS lock poisoned");
+        let senders = guard.as_ref().expect("h2r_call: not initialized");
+        // Defense-in-depth: Haskell validates before calling, but assert here too.
+        assert!(
+            len <= senders.config.max_msg_len as usize,
+            "h2r_call: len ({len}) exceeds max_msg_len ({})",
+            senders.config.max_msg_len,
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        let body: MessageBody = serde_store::from_bytes(bytes).expect("h2r_call: deserialize");
+        let msg = CallMessage {
+            token: CallToken::new(stable_ptr),
+            body,
+        };
+        senders.call_tx.send(msg).expect("h2r_call: send");
+    }));
     if let Err(e) = result {
         eprintln!("h2r_call panicked: {:?}", e);
         std::process::abort();
@@ -270,24 +319,94 @@ pub unsafe extern "C" fn h2r_call(
 /// - `data` must point to `len` valid bytes (serialized request).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn h2r_cast(data: *const u8, len: usize) {
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let guard = SENDERS.read().expect("SENDERS lock poisoned");
-            let senders = guard.as_ref().expect("h2r_cast: not initialized");
-            // Defense-in-depth: Haskell validates before calling, but assert here too.
-            assert!(
-                len <= senders.config.max_msg_len as usize,
-                "h2r_cast: len ({len}) exceeds max_msg_len ({})",
-                senders.config.max_msg_len,
-            );
-            let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-            let body: MessageBody =
-                serde_store::from_bytes(bytes).expect("h2r_cast: deserialize");
-            let msg = CastMessage { body };
-            senders.cast_tx.send(msg).expect("h2r_cast: send");
-        }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let guard = SENDERS.read().expect("SENDERS lock poisoned");
+        let senders = guard.as_ref().expect("h2r_cast: not initialized");
+        // Defense-in-depth: Haskell validates before calling, but assert here too.
+        assert!(
+            len <= senders.config.max_msg_len as usize,
+            "h2r_cast: len ({len}) exceeds max_msg_len ({})",
+            senders.config.max_msg_len,
+        );
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        let body: MessageBody = serde_store::from_bytes(bytes).expect("h2r_cast: deserialize");
+        let msg = CastMessage { body };
+        senders.cast_tx.send(msg).expect("h2r_cast: send");
+    }));
     if let Err(e) = result {
         eprintln!("h2r_cast panicked: {:?}", e);
         std::process::abort();
+    }
+}
+
+/// Subscribe to an event topic. Returns a subscription ID (>= 0).
+///
+/// For now, ignores the topic and returns subscription 0 (the single
+/// pre-created event channel). When the dispatcher is added, this will
+/// create a per-topic channel and return a new ID.
+///
+/// # Safety
+/// - `topic_ptr` must point to `topic_len` valid bytes (UTF-8 topic string).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn h2r_subscribe(_topic_ptr: *const u8, _topic_len: usize) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // TODO: when dispatcher exists, deserialize topic, create channel,
+        // register with dispatcher, store receiver in SUBSCRIPTIONS.
+        0i32
+    }));
+    match result {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("h2r_subscribe panicked: {:?}", e);
+            std::process::abort();
+        }
+    }
+}
+
+/// Block until the next event arrives on the given subscription.
+///
+/// Returns 0 on success (event bytes written via callResponse callback),
+/// or 1 on shutdown (channel disconnected).
+///
+/// Reuses the `callResponse` callback stored at init time — Rust serializes
+/// the event, calls `callResponse(stable_ptr, data, len)`, and Haskell's
+/// callback copies the bytes into the MVar.
+///
+/// # Safety
+/// - `stable_ptr` must be a valid Haskell StablePtr (MVar ByteString).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn h2r_next_event(sub_id: i32, stable_ptr: *mut c_void) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let rx = {
+            let subs = SUBSCRIPTIONS.lock().expect("SUBSCRIPTIONS lock poisoned");
+            let slot = subs
+                .get(sub_id as usize)
+                .expect("h2r_next_event: invalid subscription ID");
+            slot.as_ref()
+                .expect("h2r_next_event: subscription closed")
+                .clone()
+        };
+
+        match rx.recv() {
+            Ok(EventMessage { body }) => {
+                let response_fn = CALL_RESPONSE_FN
+                    .lock()
+                    .expect("CALL_RESPONSE_FN lock poisoned")
+                    .expect("h2r_next_event: callResponse not initialized");
+                let bytes = body.to_bytes();
+                unsafe {
+                    response_fn(stable_ptr, bytes.as_ptr(), bytes.len());
+                }
+                0
+            }
+            Err(_) => 1, // channel disconnected (shutdown)
+        }
+    }));
+    match result {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("h2r_next_event panicked: {:?}", e);
+            std::process::abort();
+        }
     }
 }

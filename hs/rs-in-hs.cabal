@@ -54,6 +54,7 @@ library
     base ^>=4.18.3.0,
     bytestring,
     mtl,
+    stm,
     store >=0.7.20,
 
   hs-source-dirs: src
@@ -77,6 +78,7 @@ executable rs-in-hs
     async,
     base ^>=4.18.3.0,
     rs-in-hs,
+    stm,
     time,
 
   hs-source-dirs: app

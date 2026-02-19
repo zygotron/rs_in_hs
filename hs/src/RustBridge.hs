@@ -1,10 +1,10 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
--- | Typesafe interface for Haskell → Rust communication via call\/cast.
+-- | Typesafe interface for Haskell ↔ Rust communication.
 --
 -- All FFI internals (pointers, StablePtr, serialization) are hidden behind the
 -- 'RustT' monad transformer. User code runs inside 'withRust' and interacts
--- with Rust exclusively through 'callRust' and 'castRust'.
+-- with Rust through 'callRust', 'castRust', and 'subscribe'.
 module RustBridge
   ( -- * Monad transformer
     RustT,
@@ -16,6 +16,10 @@ module RustBridge
     callRustTimeout,
     castRust,
 
+    -- * Events
+    subscribe,
+    TQueue,
+
     -- * Concurrency
     asyncRust,
     withAsyncRust,
@@ -25,27 +29,33 @@ module RustBridge
 
     -- * Message types
     MessageBody (..),
+    EventBody (..),
   )
 where
 
-import Control.Concurrent.Async (Async, async, withAsync)
+import Control.Concurrent.Async (Async, async, cancel, withAsync)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar)
+import Control.Concurrent.STM (TQueue, atomically, newTQueueIO, writeTQueue)
 import Control.Exception (finally, throwIO)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad (when)
 import Control.Monad.Reader (MonadReader, ReaderT (..), ask, asks)
 import Data.ByteString (ByteString, useAsCStringLen)
+import Data.ByteString.Char8 qualified as BS8
+import Data.IORef (IORef, newIORef, readIORef, modifyIORef')
 import Data.Store (Store, decode, encode)
 import System.Timeout (timeout)
-import FFI (callResponseFunPtr, h2rCall, h2rCast, h2rDeinit, h2rInit)
+import FFI (callResponseFunPtr, h2rCall, h2rCast, h2rDeinit, h2rInit, h2rSubscribe, h2rNextEvent)
+import Foreign.C.Types (CInt)
 import Foreign.Ptr (castPtr)
 import Foreign.StablePtr (newStablePtr)
-import Types (Config (..), MessageBody (..))
+import Types (Config (..), EventBody (..), MessageBody (..))
 
 -- | Internal environment. Holds config values needed for validation.
 -- Context is stored in Rust-side statics — no FFI pointer held here.
-newtype RustEnv = RustEnv
-  { envMaxMsgLen :: Int  -- ^ max serialized message length in bytes
+data RustEnv = RustEnv
+  { envMaxMsgLen :: Int            -- ^ max serialized message length in bytes
+  , envSubThreads :: IORef [Async ()]  -- ^ subscription reader threads to kill on shutdown
   }
 
 -- | Monad transformer for Rust bridge operations.
@@ -73,8 +83,19 @@ withRust config (RustT action) = do
   let configBs = encode config
   useAsCStringLen configBs $ \(ptr, len) ->
     h2rInit callResponseFunPtr (castPtr ptr) (fromIntegral len)
-  let env = RustEnv { envMaxMsgLen = fromIntegral (maxMsgLen config) }
-  runReaderT action env `finally` h2rDeinit
+  threadsRef <- newIORef []
+  let env = RustEnv
+        { envMaxMsgLen = fromIntegral (maxMsgLen config)
+        , envSubThreads = threadsRef
+        }
+  let cleanup = do
+        -- Deinit first: drops senders, disconnects channels. This causes
+        -- h2r_next_event to return 1, so eventLoop threads exit naturally.
+        h2rDeinit
+        -- Now safe to cancel (threads should already be exiting).
+        threads <- readIORef threadsRef
+        mapM_ cancel threads
+  runReaderT action env `finally` cleanup
 
 -- | Send a call (request-response) to Rust. Blocks until Rust responds.
 --
@@ -126,6 +147,39 @@ castRust req = do
     useAsCStringLen bs $ \(ptr, len) -> do
       checkMsgLen "castRust" maxLen len
       h2rCast (castPtr ptr) (fromIntegral len)
+
+-- | Subscribe to an event topic. Returns a 'TQueue' that receives decoded events.
+--
+-- Calls @h2r_subscribe@ with the topic string, then spawns a reader thread
+-- that loops @h2r_next_event@, decodes each event, and writes it to the queue.
+-- The reader thread is automatically cancelled when 'withRust' exits.
+subscribe :: (Store event, MonadIO m) => String -> RustT m (TQueue event)
+subscribe topic = do
+  threadsRef <- asks envSubThreads
+  liftIO $ do
+    let topicBs = BS8.pack topic
+    subId <- useAsCStringLen topicBs $ \(ptr, len) ->
+      h2rSubscribe (castPtr ptr) (fromIntegral len)
+    queue <- newTQueueIO
+    readerThread <- async $ eventLoop subId queue
+    modifyIORef' threadsRef (readerThread :)
+    pure queue
+
+-- | Internal event reader loop. Blocks on @h2r_next_event@ and writes
+-- decoded events to the queue. Exits when the channel disconnects (status 1).
+eventLoop :: Store event => CInt -> TQueue event -> IO ()
+eventLoop subId queue = do
+  mvar <- newEmptyMVar :: IO (MVar ByteString)
+  sptr <- newStablePtr mvar
+  status <- h2rNextEvent subId sptr
+  case status of
+    0 -> do
+      bs <- takeMVar mvar
+      case decode bs of
+        Right event -> atomically $ writeTQueue queue event
+        Left err    -> throwIO err
+      eventLoop subId queue
+    _ -> pure () -- shutdown
 
 -- | Spawn an async in the RustT environment. Caller manages the handle.
 asyncRust :: RustT IO a -> RustT IO (Async a)
