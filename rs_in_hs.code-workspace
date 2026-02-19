@@ -1,0 +1,22 @@
+{
+  "folders": [
+    {
+      "path": ".",
+      "name": "root"
+    },
+    {
+      "path": "hs",
+      "name": "hs"
+    },
+    {
+      "path": "rs",
+      "name": "rs"
+    }
+  ],
+  "settings": {
+    "files.exclude": {
+      "hs": true,
+      "rs": true
+    }
+  }
+}

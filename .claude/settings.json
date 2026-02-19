@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(just build:*)",
+      "Bash(just clean:*)",
+      "Bash(just run:*)",
+      "Bash(just build-hs:*)",
+      "Bash(just build-rs:*)"
+    ]
+  }
+}
